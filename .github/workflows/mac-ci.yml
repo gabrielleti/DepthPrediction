@@ -1,0 +1,67 @@
+name: macOS CI
+
+on:
+  push:
+    branches: [ main, master, develop, codex/** ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build & Test on macOS
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Display Swift Version
+        run: swift --version
+
+      - name: Environment Check
+        run: |
+          chmod +x scripts/env_check.sh
+          ./scripts/env_check.sh
+
+      - name: Build DepthRunner
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh
+
+      - name: Run Sample Test
+        run: |
+          chmod +x scripts/run_sample.sh
+          if [[ -f "resource/IMG_3623.PNG" ]]; then
+            ./scripts/run_sample.sh
+          else
+            echo "⚠️ Testbild resource/IMG_3623.PNG nicht gefunden - überspringe Sample-Test"
+            echo "Hinweis: Füge Testbilder zum Repository hinzu oder verwende Git LFS"
+          fi
+
+      - name: Upload Test Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-outputs
+          path: |
+            output/qa/**/*
+            **/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload Build Artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: depthrunner-binary
+          path: .build/release/DepthRunner
+          retention-days: 14
+          if-no-files-found: warn
+
+

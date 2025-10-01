@@ -95,6 +95,58 @@ Download model from [apple's model page](https://developer.apple.com/machine-lea
 | iPhone 6S+    | 1038 ms | ⏲ | 1051 ms |
 
 
+## Local Test
+
+### Quick Start
+
+```bash
+# 1. Umgebung prüfen
+./scripts/env_check.sh
+
+# 2. Projekt bauen
+./scripts/build.sh
+
+# 3. Beispiel ausführen (verwendet resource/IMG_3623.PNG)
+./scripts/run_sample.sh
+
+# 4. Mit eigenem Bild
+INPUT=/pfad/zum/bild.jpg ./scripts/run_sample.sh
+
+# 5. QA-Tests (mehrere Bilder)
+./scripts/qa_smoke.sh
+```
+
+### Voraussetzungen
+
+- **macOS 12.0+** (CoreML/CoreImage erforderlich)
+- **Xcode 10.2+** mit Command Line Tools
+- **Swift 5.7+**
+- **CoreML-Modell** (z.B. MiDaS, FCRN) - [Download hier](https://developer.apple.com/machine-learning/models/)
+
+### Skripte
+
+| Skript | Beschreibung |
+|--------|--------------|
+| `scripts/env_check.sh` | Prüft Umgebung (macOS, Xcode, Swift, Frameworks) |
+| `scripts/build.sh` | Baut DepthRunner im Release-Modus |
+| `scripts/run_sample.sh` | Führt Single-Image-Test aus (parametrisierbar) |
+| `scripts/qa_smoke.sh` | Multi-Image QA-Tests |
+
+### Ausgabe
+
+Alle Test-Outputs landen in `output/qa/`:
+- `*_depth.png` - Normalisierte Tiefenkarte (Grayscale)
+- `*.ply` - 3D-Punktwolke (PLY-Format)
+- `*.log` - Volumen-Logs & Plausibilitätschecks
+
+### Dokumentation
+
+Siehe `docs/ANALYSIS.md` für:
+- Vollständige CLI-Flag-Referenz
+- Pipeline-Flow-Diagramm
+- Troubleshooting-Guide
+- Quick Reference (1 Seite)
+
 ## See also
 
 - [motlabs/iOS-Proejcts-with-ML-Models](https://github.com/motlabs/iOS-Proejcts-with-ML-Models)<br>
