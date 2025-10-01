@@ -1,0 +1,1656 @@
+import CoreImage
+import CoreGraphics
+import CoreML
+import CoreVideo
+import Foundation
+import ImageIO
+import simd
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
+#if canImport(MobileCoreServices)
+import MobileCoreServices
+#endif
+
+private let kAssumedPlateDiameterM: Float = 0.25
+private let kAutoScaleMinDiameterM: Float = 0.05
+private let kAutoScaleMaxDiameterM: Float = 1.0
+
+@main
+struct DepthRunner {
+    static func main() {
+        do {
+            let options = try CommandLineOptions.parse()
+            let modelURL = try ModelLocator().locateModel()
+            let generator = try DepthMapGenerator(modelURL: modelURL)
+            let result = try generator.generateDepthMap(inputPath: options.inputPath, outputPath: options.outputPath)
+            print("Depth map saved to \(result.destinationURL.path)")
+
+            if options.requiresPointCloud {
+                let (intrinsics, intrinsicsMessages) = options.resolveIntrinsics(width: result.width, height: result.height)
+                for message in intrinsicsMessages {
+                    if message.hasPrefix("Warning:") {
+                        fputs("\(message)\n", stderr)
+                    } else {
+                        print(message)
+                    }
+                }
+
+                if !options.roiMessages.isEmpty {
+                    for message in options.roiMessages {
+                        fputs("\(message)\n", stderr)
+                    }
+                }
+
+                if !options.trimMessages.isEmpty {
+                    for message in options.trimMessages {
+                        fputs("\(message)\n", stderr)
+                    }
+                }
+
+                let width = result.width
+                let height = result.height
+
+                var manualROI = options.resolveManualROI(width: width, height: height)
+                if case .center(let fraction) = options.roiSpecifier {
+                    print(String(format: "Applying ROI: center=%.2f", fraction))
+                }
+
+                let initialROI = options.usesAutoROI ? nil : manualROI
+
+                var samples = depthToPointSamples(
+                    depth: result.depthPixelBuffer,
+                    intrinsics: intrinsics,
+                    zMin: options.trimConfig.zMin,
+                    zMax: options.trimConfig.zMax,
+                    roi: initialROI
+                )
+
+                if samples.isEmpty {
+                    let roiInfo = makeROIInfo(width: width, height: height, roi: initialROI)
+                    if roiInfo.sampleCount == 0 {
+                        fputs("Warning: ROI yielded zero candidate pixels; skipping point cloud and volume computation.\n", stderr)
+                    } else {
+                        fputs("Warning: No valid depth points found after ROI and depth filtering; skipping point cloud and volume computation.\n", stderr)
+                    }
+                } else {
+                    if let clipConfig = options.groundClipConfig {
+                        let planeCandidates = samples.map { $0.position }
+                        if let plane = fitGroundPlaneLSQ(points: planeCandidates, percentile: clipConfig.percentile) {
+                            let clippedSamples = clipGround(samples: samples, plane: plane, eps: clipConfig.eps)
+                            let removedCount = samples.count - clippedSamples.count
+                            let removalFraction = samples.isEmpty ? 0 : Float(removedCount) / Float(samples.count)
+                            print(
+                                String(
+                                    format: "Ground plane removed: %.1f%% of points (ε=%.3fm, p=%.2f)",
+                                    removalFraction * 100,
+                                    clipConfig.eps,
+                                    clipConfig.percentile
+                                )
+                            )
+                            samples = clippedSamples
+                        } else {
+                            fputs("Warning: Unable to fit a stable ground plane; skipping ground clipping.\n", stderr)
+                        }
+                    }
+
+                    let trimResult = trimSamples(samples, config: options.trimConfig)
+                    let keptPercent = trimResult.keptFraction * 100
+                    print(
+                        String(
+                            format: "Trim: kept %.1f%% (p=%.3f), Z-band=[%.2f,%.2f] m",
+                            keptPercent,
+                            options.trimConfig.percentile,
+                            options.trimConfig.zMin,
+                            options.trimConfig.zMax
+                        )
+                    )
+                    if trimResult.originalCount > 0 && trimResult.samples.count < 500 {
+                        fputs("Warning: Weniger als 500 Punkte nach Trim; Ergebnis möglicherweise unsicher.\n", stderr)
+                    }
+
+                    var workingSamples = trimResult.samples
+
+                    var autoOutcome: AutoROIOutcome?
+                    if case .auto(let autoConfig) = options.roiSpecifier {
+                        autoOutcome = autoROI(from: workingSamples, width: width, height: height, config: autoConfig)
+                        for warning in autoOutcome?.warnings ?? [] {
+                            fputs("\(warning)\n", stderr)
+                        }
+                        manualROI = autoOutcome?.rect
+                    }
+
+                    let roiInfo = makeROIInfo(width: width, height: height, roi: manualROI)
+
+                    if case .auto(let autoConfig) = options.roiSpecifier {
+                        let totalPixels = CGFloat(width * height)
+                        let rect = roiInfo.rect ?? CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+                        let coverage = totalPixels > 0 ? (rect.width * rect.height) / totalPixels * 100 : 0
+                        let x = Int(rect.origin.x.rounded(.down))
+                        let y = Int(rect.origin.y.rounded(.down))
+                        let w = max(0, Int(round(rect.width)))
+                        let h = max(0, Int(round(rect.height)))
+                        var message = String(
+                            format: "ROI-auto: near=%.0f%%, margin=%.0f%%, minSize=%.0f%% → rect=(x=%d, y=%d, w=%d, h=%d) px, coverage=%.1f%%",
+                            autoConfig.nearPercentile * 100,
+                            autoConfig.margin * 100,
+                            autoConfig.minSize * 100,
+                            x,
+                            y,
+                            max(w, 0),
+                            max(h, 0),
+                            coverage
+                        )
+                        if autoOutcome?.fallbackUsed == true {
+                            message.append(" (fallback=central)")
+                        }
+                        print(message)
+                    }
+
+                    if roiInfo.sampleCount == 0 {
+                        fputs("Warning: ROI yielded zero candidate pixels; skipping point cloud and volume computation.\n", stderr)
+                    } else {
+                        let filteredSamples = filterSamples(workingSamples, within: roiInfo.rect, width: width, height: height)
+                        if filteredSamples.isEmpty {
+                            fputs("Warning: ROI produced no remaining points after filtering; skipping point cloud and volume computation.\n", stderr)
+                        } else {
+                            if options.volumeRequested {
+                                var simdPoints = filteredSamples.map { $0.position }
+                                let autoScaleOutcome = applyAutoScaleIfNeeded(
+                                    points: &simdPoints,
+                                    assumedDiameterM: kAssumedPlateDiameterM,
+                                    disable: options.autoScaleDisabled
+                                )
+
+                                switch autoScaleOutcome {
+                                case .applied(let measured, let factor):
+                                    print(
+                                        String(
+                                            format: "Auto-scale: assumed=%.1f cm, measured=%.4f m, factor=%.3f",
+                                            Double(kAssumedPlateDiameterM * 100),
+                                            Double(measured),
+                                            Double(factor)
+                                        )
+                                    )
+                                case .skipped(let measured):
+                                    let measuredDisplay: String
+                                    if let measured {
+                                        measuredDisplay = String(format: "%.4f", Double(measured))
+                                    } else {
+                                        measuredDisplay = "n/a"
+                                    }
+                                    let minDisplay = String(format: "%.2f", Double(kAutoScaleMinDiameterM))
+                                    let maxDisplay = String(format: "%.2f", Double(kAutoScaleMaxDiameterM))
+                                    print("Auto-scale skipped: measured=\(measuredDisplay) m outside [\(minDisplay), \(maxDisplay)] or insufficient points")
+                                case .disabled:
+                                    print("Auto-scale disabled (--no-auto-scale).")
+                                }
+
+                                computeAndLogVolume(
+                                    for: simdPoints,
+                                    roiInfo: roiInfo,
+                                    unit: options.volumeUnit,
+                                    autoScaleOutcome: autoScaleOutcome
+                                )
+                            }
+
+                            if !options.pointCloudRequests.isEmpty {
+                                let tuplePoints = filteredSamples.map { sample in
+                                    let position = sample.position
+                                    return (position.x, position.y, position.z)
+                                }
+                                try exportPointClouds(points: tuplePoints, requests: options.pointCloudRequests)
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            fputs("Error: \(error.localizedDescription)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+}
+
+private func exportPointClouds(points: [(Float, Float, Float)], requests: [PointCloudRequest]) throws {
+    let locale = Locale(identifier: "en_US_POSIX")
+    for request in requests {
+        let url = try resolvePointCloudURL(from: request.path, defaultExtension: request.format.defaultExtension)
+        let directoryURL = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+        switch request.format {
+        case .ply:
+            let header = [
+                "ply",
+                "format ascii 1.0",
+                "element vertex \(points.count)",
+                "property float x",
+                "property float y",
+                "property float z",
+                "end_header"
+            ].joined(separator: "\n")
+
+            var body = points.map { point in
+                String(
+                    format: "%.6f %.6f %.6f",
+                    locale: locale,
+                    Double(point.0),
+                    Double(point.1),
+                    Double(point.2)
+                )
+            }.joined(separator: "\n")
+            if !body.isEmpty {
+                body.append("\n")
+            }
+            let content = header + "\n" + body
+            do {
+                try content.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                throw DepthRunnerError.pointCloudWriteFailed(url.path)
+            }
+        case .xyz:
+            var content = points.map { point in
+                String(
+                    format: "%.6f %.6f %.6f",
+                    locale: locale,
+                    Double(point.0),
+                    Double(point.1),
+                    Double(point.2)
+                )
+            }.joined(separator: "\n")
+            if !content.isEmpty {
+                content.append("\n")
+            }
+            do {
+                try content.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                throw DepthRunnerError.pointCloudWriteFailed(url.path)
+            }
+        }
+
+        print("Point cloud (\(request.format.description)) saved to \(url.path) [\(points.count) points]")
+    }
+}
+
+private struct GroundClipConfig {
+    let percentile: Float
+    let eps: Float
+}
+
+private struct TrimConfig {
+    let percentile: Float
+    let zMin: Float
+    let zMax: Float
+}
+
+private struct TrimResult {
+    let samples: [PointSample]
+    let keptFraction: Float
+    let originalCount: Int
+}
+
+private struct AutoROIConfig {
+    let nearPercentile: Float
+    let margin: Float
+    let minSize: Float
+}
+
+private func percentile(_ values: [Float], percentile: Float) -> Float {
+    guard !values.isEmpty else { return 0 }
+    let clamped = max(0, min(1, percentile))
+    let sorted = values.sorted()
+    let index = Int(Float(sorted.count - 1) * clamped)
+    let clampedIndex = max(0, min(index, sorted.count - 1))
+    return sorted[clampedIndex]
+}
+
+private func trimSamples(_ samples: [PointSample], config: TrimConfig) -> TrimResult {
+    let originalCount = samples.count
+    guard !samples.isEmpty else {
+        return TrimResult(samples: samples, keptFraction: 0, originalCount: 0)
+    }
+
+    let zBandSamples = samples.filter { sample in
+        let z = sample.position.z
+        return z >= config.zMin && z <= config.zMax
+    }
+
+    guard !zBandSamples.isEmpty else {
+        return TrimResult(samples: zBandSamples, keptFraction: 0, originalCount: originalCount)
+    }
+
+    var filteredSamples = zBandSamples
+
+    if filteredSamples.count >= 20 {
+        let xs = filteredSamples.map { $0.position.x }
+        let ys = filteredSamples.map { $0.position.y }
+        let zs = filteredSamples.map { $0.position.z }
+
+        let highPercentile = max(0, min(1, config.percentile))
+        let lowPercentile = max(0, min(1, 1 - config.percentile))
+
+        if highPercentile >= lowPercentile {
+            let xLow = percentile(xs, percentile: lowPercentile)
+            let xHigh = percentile(xs, percentile: highPercentile)
+            let yLow = percentile(ys, percentile: lowPercentile)
+            let yHigh = percentile(ys, percentile: highPercentile)
+            let zLow = percentile(zs, percentile: lowPercentile)
+            let zHigh = percentile(zs, percentile: highPercentile)
+
+            let trimmed = filteredSamples.filter { sample in
+                let point = sample.position
+                return point.x >= xLow && point.x <= xHigh &&
+                    point.y >= yLow && point.y <= yHigh &&
+                    point.z >= zLow && point.z <= zHigh
+            }
+
+            if !trimmed.isEmpty {
+                filteredSamples = trimmed
+            }
+        }
+    }
+
+    let keptFraction = originalCount > 0 ? Float(filteredSamples.count) / Float(originalCount) : 0
+
+    return TrimResult(samples: filteredSamples, keptFraction: keptFraction, originalCount: originalCount)
+}
+
+private struct ROIInfo {
+    let rect: CGRect?
+    let sampleCount: Int
+}
+
+private func makeROIInfo(width: Int, height: Int, roi: CGRect?) -> ROIInfo {
+    guard width > 0, height > 0 else {
+        return ROIInfo(rect: nil, sampleCount: 0)
+    }
+
+    guard let roi else {
+        return ROIInfo(rect: nil, sampleCount: width * height)
+    }
+
+    if roi.isNull || roi.isEmpty {
+        return ROIInfo(rect: nil, sampleCount: 0)
+    }
+
+    let xStart = max(0, Int(floor(roi.minX)))
+    let yStart = max(0, Int(floor(roi.minY)))
+    let xEnd = min(width, Int(ceil(roi.maxX)))
+    let yEnd = min(height, Int(ceil(roi.maxY)))
+
+    if xStart >= xEnd || yStart >= yEnd {
+        return ROIInfo(rect: nil, sampleCount: 0)
+    }
+
+    let sanitized = CGRect(
+        x: CGFloat(xStart),
+        y: CGFloat(yStart),
+        width: CGFloat(xEnd - xStart),
+        height: CGFloat(yEnd - yStart)
+    )
+    let sampleCount = (xEnd - xStart) * (yEnd - yStart)
+    return ROIInfo(rect: sanitized, sampleCount: sampleCount)
+}
+
+private func fitGroundPlaneLSQ(points: [SIMD3<Float>], percentile: Float) -> (a: Float, b: Float, c: Float)? {
+    guard !points.isEmpty else { return nil }
+
+    let clampedPercentile = max(0, min(1, percentile))
+    let sortedZ = points.map { $0.z }.sorted()
+    guard let lastIndex = sortedZ.indices.last else { return nil }
+    let thresholdIndex = min(max(Int(Float(lastIndex) * clampedPercentile), 0), lastIndex)
+    let zThreshold = sortedZ[thresholdIndex]
+    let candidates = points.filter { $0.z <= zThreshold }
+    guard candidates.count >= 100 else { return nil }
+
+    var ata = simd_float3x3()
+    var atz = SIMD3<Float>(repeating: 0)
+    for point in candidates {
+        let v = SIMD3<Float>(point.x, point.y, 1)
+        ata += simd_outer(v, v)
+        atz += v * point.z
+    }
+
+    let determinant = simd_determinant(ata)
+    guard determinant.isFinite, abs(determinant) > 1e-6 else { return nil }
+
+    let coeff = simd_inverse(ata) * atz
+    guard coeff.x.isFinite, coeff.y.isFinite, coeff.z.isFinite else { return nil }
+    return (coeff.x, coeff.y, coeff.z)
+}
+
+private func clipGround(samples: [PointSample], plane: (a: Float, b: Float, c: Float), eps: Float) -> [PointSample] {
+    let (a, b, c) = plane
+    return samples.filter { sample in
+        let point = sample.position
+        let predictedZ = a * point.x + b * point.y + c
+        return (point.z - predictedZ) > eps
+    }
+}
+
+private struct AutoROIOutcome {
+    let rect: CGRect
+    let fallbackUsed: Bool
+    let warnings: [String]
+}
+
+private func autoROI(from samples: [PointSample], width: Int, height: Int, config: AutoROIConfig) -> AutoROIOutcome {
+    let fallbackRect = makeCentralROI(width: width, height: height, fraction: 0.60)
+    var warnings: [String] = []
+
+    guard width > 0, height > 0 else {
+        warnings.append("Warning: ROI-auto fallback to central crop because the frame dimensions are invalid.")
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    let finiteSamples = samples.filter { $0.position.z.isFinite }
+    if finiteSamples.count < 500 {
+        warnings.append("Warning: ROI-auto fallback to central crop because only \(finiteSamples.count) filtered points were available.")
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    guard let minZ = finiteSamples.map({ $0.position.z }).min(),
+          let maxZ = finiteSamples.map({ $0.position.z }).max() else {
+        warnings.append("Warning: ROI-auto fallback to central crop because no finite depths were available.")
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    let contrast = maxZ - minZ
+    let minimumContrast: Float = 0.002
+    if !contrast.isFinite || contrast < minimumContrast {
+        warnings.append(String(format: "Warning: ROI-auto fallback to central crop because depth contrast is too low (Δz=%.4f m).", contrast))
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    let percentileValue = max(0, min(1, config.nearPercentile))
+    let sortedDepths = finiteSamples.map { $0.position.z }.sorted()
+    let thresholdIndex = max(0, min(Int(Float(sortedDepths.count - 1) * percentileValue), sortedDepths.count - 1))
+    let zThreshold = sortedDepths[thresholdIndex]
+
+    var left = width
+    var right = -1
+    var top = height
+    var bottom = -1
+
+    for sample in finiteSamples {
+        let z = sample.position.z
+        if z <= zThreshold {
+            if sample.u < left { left = sample.u }
+            if sample.u > right { right = sample.u }
+            if sample.v < top { top = sample.v }
+            if sample.v > bottom { bottom = sample.v }
+        }
+    }
+
+    if right < left || bottom < top {
+        warnings.append("Warning: ROI-auto fallback to central crop because no near-depth region could be determined.")
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    let marginX = max(0, Int(round(Float(width) * config.margin)))
+    let marginY = max(0, Int(round(Float(height) * config.margin)))
+    left = max(0, left - marginX)
+    right = min(width - 1, right + marginX)
+    top = max(0, top - marginY)
+    bottom = min(height - 1, bottom + marginY)
+
+    let minSpanX = max(1, Int(round(Float(width) * config.minSize)))
+    let minSpanY = max(1, Int(round(Float(height) * config.minSize)))
+    let (finalLeft, finalRight) = expandRange(start: left, end: right, minSpan: minSpanX, limit: width)
+    let (finalTop, finalBottom) = expandRange(start: top, end: bottom, minSpan: minSpanY, limit: height)
+
+    guard finalRight >= finalLeft, finalBottom >= finalTop else {
+        warnings.append("Warning: ROI-auto fallback to central crop because computed bounds were invalid.")
+        return AutoROIOutcome(rect: fallbackRect, fallbackUsed: true, warnings: warnings)
+    }
+
+    let rect = CGRect(
+        x: CGFloat(finalLeft),
+        y: CGFloat(finalTop),
+        width: CGFloat(finalRight - finalLeft + 1),
+        height: CGFloat(finalBottom - finalTop + 1)
+    )
+
+    return AutoROIOutcome(rect: rect, fallbackUsed: false, warnings: warnings)
+}
+
+private func makeCentralROI(width: Int, height: Int, fraction: CGFloat) -> CGRect {
+    let clampedFraction = max(0, min(1, fraction))
+    guard width > 0, height > 0, clampedFraction > 0 else {
+        return .null
+    }
+    let frameWidth = CGFloat(width)
+    let frameHeight = CGFloat(height)
+    let roiWidth = frameWidth * clampedFraction
+    let roiHeight = frameHeight * clampedFraction
+    let originX = (frameWidth - roiWidth) / 2
+    let originY = (frameHeight - roiHeight) / 2
+    return CGRect(x: originX, y: originY, width: roiWidth, height: roiHeight)
+}
+
+private func filterSamples(_ samples: [PointSample], within rect: CGRect?, width: Int, height: Int) -> [PointSample] {
+    guard let rect else { return samples }
+    let xStart = max(0, Int(floor(rect.minX)))
+    let yStart = max(0, Int(floor(rect.minY)))
+    let xEnd = min(width, Int(ceil(rect.maxX)))
+    let yEnd = min(height, Int(ceil(rect.maxY)))
+    if xStart >= xEnd || yStart >= yEnd {
+        return []
+    }
+    return samples.filter { sample in
+        let u = sample.u
+        let v = sample.v
+        return u >= xStart && u < xEnd && v >= yStart && v < yEnd
+    }
+}
+
+private func expandRange(start: Int, end: Int, minSpan: Int, limit: Int) -> (Int, Int) {
+    guard limit > 0 else { return (0, -1) }
+    var clampedStart = max(0, min(start, limit - 1))
+    var clampedEnd = max(0, min(end, limit - 1))
+    if clampedEnd < clampedStart {
+        swap(&clampedStart, &clampedEnd)
+    }
+
+    let targetSpan = min(max(minSpan, 1), limit)
+    let currentSpan = clampedEnd - clampedStart + 1
+    if currentSpan >= targetSpan {
+        return (clampedStart, clampedEnd)
+    }
+
+    var newStart = clampedStart
+    var newEnd = clampedEnd
+    let additional = targetSpan - currentSpan
+    var extraStart = additional / 2
+    var extraEnd = additional - extraStart
+    newStart = max(0, newStart - extraStart)
+    newEnd = min(limit - 1, newEnd + extraEnd)
+
+    var span = newEnd - newStart + 1
+    if span < targetSpan {
+        let remaining = targetSpan - span
+        if newStart == 0 {
+            newEnd = min(limit - 1, newEnd + remaining)
+        } else if newEnd == limit - 1 {
+            newStart = max(0, newStart - remaining)
+        } else {
+            let shiftStart = min(newStart, remaining / 2)
+            let shiftEnd = min(limit - 1 - newEnd, remaining - shiftStart)
+            newStart -= shiftStart
+            newEnd += shiftEnd
+        }
+        span = newEnd - newStart + 1
+    }
+
+    if span < targetSpan {
+        if targetSpan >= limit {
+            return (0, limit - 1)
+        }
+        let center = (clampedStart + clampedEnd) / 2
+        let halfSpan = targetSpan / 2
+        newStart = max(0, min(limit - targetSpan, center - halfSpan))
+        newEnd = min(limit - 1, newStart + targetSpan - 1)
+    }
+
+    newStart = max(0, min(newStart, limit - 1))
+    newEnd = max(newStart, min(newEnd, limit - 1))
+    return (newStart, newEnd)
+}
+
+private enum AutoScaleOutcome {
+    case applied(measured: Float, factor: Float)
+    case skipped(measured: Float?)
+    case disabled
+
+    var wasApplied: Bool {
+        if case .applied = self { return true }
+        return false
+    }
+}
+
+private func applyAutoScaleIfNeeded(points: inout [SIMD3<Float>], assumedDiameterM: Float, disable: Bool) -> AutoScaleOutcome {
+    if disable {
+        return .disabled
+    }
+
+    guard points.count >= 500 else {
+        return .skipped(measured: nil)
+    }
+
+    var minX = Float.greatestFiniteMagnitude
+    var maxX = -Float.greatestFiniteMagnitude
+    var minY = Float.greatestFiniteMagnitude
+    var maxY = -Float.greatestFiniteMagnitude
+
+    for point in points {
+        minX = min(minX, point.x)
+        maxX = max(maxX, point.x)
+        minY = min(minY, point.y)
+        maxY = max(maxY, point.y)
+    }
+
+    let dx = maxX - minX
+    let dy = maxY - minY
+    let measuredDiameter = max(dx, dy)
+
+    guard measuredDiameter.isFinite, measuredDiameter > 0 else {
+        return .skipped(measured: nil)
+    }
+
+    if measuredDiameter < kAutoScaleMinDiameterM || measuredDiameter > kAutoScaleMaxDiameterM {
+        return .skipped(measured: measuredDiameter)
+    }
+
+    let factor = assumedDiameterM / measuredDiameter
+    for index in points.indices {
+        points[index] = points[index] * factor
+    }
+
+    return .applied(measured: measuredDiameter, factor: factor)
+}
+
+private func computeAndLogVolume(for points: [SIMD3<Float>], roiInfo: ROIInfo, unit: VolumeUnit, autoScaleOutcome: AutoScaleOutcome) {
+    let baseStats = points.withUnsafeBufferPointer { buffer -> VolumeStats in
+        computeAABBVolume(points: buffer, unit: unit)
+    }
+
+    let totalSamples = roiInfo.sampleCount
+    let confidence: Double
+    if totalSamples > 0 && baseStats.numPointsUsed > 0 {
+        confidence = Double(baseStats.numPointsUsed) / Double(totalSamples)
+    } else {
+        confidence = 0
+    }
+
+    let finalStats = VolumeStats(
+        volumeML: baseStats.volumeML,
+        bboxMin: baseStats.bboxMin,
+        bboxMax: baseStats.bboxMax,
+        numPointsUsed: baseStats.numPointsUsed,
+        numPointsTotal: totalSamples,
+        confidence: confidence
+    )
+
+    logVolumeStats(finalStats, unit: unit, scaled: autoScaleOutcome.wasApplied)
+}
+
+private func logVolumeStats(_ stats: VolumeStats, unit: VolumeUnit, scaled: Bool) {
+    let confidenceClamped = max(0, min(1, stats.confidence))
+    print(
+        String(
+            format: "Points(total=%d, used=%d, conf=%.2f)",
+            stats.numPointsTotal,
+            stats.numPointsUsed,
+            confidenceClamped
+        )
+    )
+
+    print(
+        String(
+            format: "BBox[m]: x:[%.4f, %.4f], y:[%.4f, %.4f], z:[%.4f, %.4f]",
+            stats.bboxMin.x,
+            stats.bboxMax.x,
+            stats.bboxMin.y,
+            stats.bboxMax.y,
+            stats.bboxMin.z,
+            stats.bboxMax.z
+        )
+    )
+
+    let volumeValue = stats.volumeML
+    let volumeString: String
+    switch unit {
+    case .ml, .cm3:
+        volumeString = String(format: "%.2f", volumeValue)
+    case .m3:
+        volumeString = String(format: "%.6f", volumeValue)
+    }
+
+    let label = scaled ? "Volume (scaled)" : "Volume"
+    print("\(label): \(volumeString) \(unit.displayName)")
+
+    if stats.numPointsUsed < 500 {
+        fputs("Warning: zu wenig Punkte für robuste AABB, Ergebnis unsicher.\n", stderr)
+    }
+
+    let lowerBound: Float = 0.10
+    let upperBound: Float = 0.80
+    if stats.numPointsUsed > 0 {
+        if stats.bboxMin.z <= lowerBound + 0.001 {
+            fputs("Warning: Bounding box minimum depth is near the lower filter limit (0.10 m).\n", stderr)
+        }
+        if stats.bboxMax.z >= upperBound - 0.001 {
+            fputs("Warning: Bounding box maximum depth is near the upper filter limit (0.80 m).\n", stderr)
+        }
+    }
+}
+
+private enum PointCloudFormat {
+    case ply
+    case xyz
+
+    var defaultExtension: String {
+        switch self {
+        case .ply:
+            return "ply"
+        case .xyz:
+            return "xyz"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .ply:
+            return "PLY"
+        case .xyz:
+            return "XYZ"
+        }
+    }
+}
+
+private struct PointCloudRequest {
+    let format: PointCloudFormat
+    let path: String
+}
+
+private struct DepthGenerationResult {
+    let depthPixelBuffer: CVPixelBuffer
+    let width: Int
+    let height: Int
+    let destinationURL: URL
+}
+
+private struct CommandLineOptions {
+    enum IntrinsicsSpecifier {
+        case explicit(CameraIntrinsics)
+        case fov(Float)
+        case unspecified
+        case invalid(String)
+    }
+
+    let inputPath: String
+    let outputPath: String?
+    let pointCloudRequests: [PointCloudRequest]
+    let volumeRequested: Bool
+    let volumeUnit: VolumeUnit
+    let intrinsicsSpecifier: IntrinsicsSpecifier
+    let intrinsicsIssues: [String]
+    let ignoredFOV: Float?
+    let roiSpecifier: ROISpecifier
+    let roiMessages: [String]
+    let groundClipConfig: GroundClipConfig?
+    let trimConfig: TrimConfig
+    let trimMessages: [String]
+    let autoScaleDisabled: Bool
+
+    static func parse() throws -> CommandLineOptions {
+        var arguments = Array(CommandLine.arguments.dropFirst())
+        guard !arguments.isEmpty else {
+            throw DepthRunnerError.invalidUsage("Missing required <eingabe_bildpfad> argument.")
+        }
+
+        var inputPath: String?
+        var outputPath: String?
+        var pointCloudRequests: [PointCloudRequest] = []
+        var volumeRequested = false
+        var volumeUnit: VolumeUnit = .ml
+
+        var fx: Float?
+        var fy: Float?
+        var cx: Float?
+        var cy: Float?
+        var providedFOV: Float?
+        var intrinsicsIssues: [String] = []
+        var ignoredFOV: Float?
+        var roiSpecifier: ROISpecifier = .none
+        var roiMessages: [String] = []
+        var clipGround = false
+        var groundPercentile: Float = 0.10
+        var groundEps: Float = 0.008
+        var groundPercentileSpecified = false
+        var groundEpsSpecified = false
+        var trimPercentile: Float = 0.98
+        var trimMessages: [String] = []
+        var zBandMin: Float = 0.10
+        var zBandMax: Float = 0.80
+        var autoROIRequested = false
+        var autoROINearPercentile: Float = 0.30
+        var autoROIMargin: Float = 0.05
+        var autoROIMinSize: Float = 0.35
+        var autoROIParameterUsed = false
+        var autoScaleDisabled = false
+
+        func parseFloat(_ value: String, flag: String) -> Float? {
+            if let parsed = Float(value) {
+                return parsed
+            }
+            intrinsicsIssues.append("Value for \(flag) must be a valid number (got \(value)).")
+            return nil
+        }
+
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--out":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --out option.")
+                }
+                outputPath = arguments[index]
+            case "--ply":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --ply option.")
+                }
+                pointCloudRequests.append(PointCloudRequest(format: .ply, path: arguments[index]))
+            case "--xyz":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --xyz option.")
+                }
+                pointCloudRequests.append(PointCloudRequest(format: .xyz, path: arguments[index]))
+            case "--volume":
+                volumeRequested = true
+            case "--unit":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --unit option.")
+                }
+                let value = arguments[index].lowercased()
+                guard let parsedUnit = VolumeUnit(rawValue: value) else {
+                    throw DepthRunnerError.invalidUsage("Unknown volume unit: \(value). Expected ml, cm3, or m3.")
+                }
+                volumeUnit = parsedUnit
+            case "--fx":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --fx option.")
+                }
+                fx = parseFloat(arguments[index], flag: "--fx")
+            case "--fy":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --fy option.")
+                }
+                fy = parseFloat(arguments[index], flag: "--fy")
+            case "--cx":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --cx option.")
+                }
+                cx = parseFloat(arguments[index], flag: "--cx")
+            case "--cy":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --cy option.")
+                }
+                cy = parseFloat(arguments[index], flag: "--cy")
+            case "--fov":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --fov option.")
+                }
+                providedFOV = parseFloat(arguments[index], flag: "--fov")
+            case "--roi":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --roi option.")
+                }
+                if autoROIRequested {
+                    throw DepthRunnerError.invalidUsage("--roi cannot be combined with --roi-auto.")
+                }
+                let value = arguments[index]
+                let components = value.split(separator: "=", maxSplits: 1)
+                guard components.count == 2 else {
+                    throw DepthRunnerError.invalidUsage("ROI must be specified as center=<fraction>.")
+                }
+                let key = components[0].lowercased()
+                let fractionString = String(components[1])
+                guard key == "center" else {
+                    throw DepthRunnerError.invalidUsage("Unsupported ROI specifier: \(key). Only center=<fraction> is supported.")
+                }
+                guard let fraction = Float(fractionString) else {
+                    throw DepthRunnerError.invalidUsage("ROI fraction must be a valid number (got \(fractionString)).")
+                }
+                guard fraction > 0, fraction <= 1 else {
+                    throw DepthRunnerError.invalidUsage("ROI fraction must be between 0 and 1 (exclusive of 0).")
+                }
+                roiSpecifier = .center(fraction)
+            case "--roi-auto":
+                if case .center = roiSpecifier {
+                    throw DepthRunnerError.invalidUsage("--roi-auto cannot be combined with --roi center=…")
+                }
+                autoROIRequested = true
+            case "--roi-near-percentile":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --roi-near-percentile option.")
+                }
+                guard let value = Float(arguments[index]) else {
+                    throw DepthRunnerError.invalidUsage("Value for --roi-near-percentile must be a valid number.")
+                }
+                autoROINearPercentile = value
+                autoROIParameterUsed = true
+            case "--roi-margin":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --roi-margin option.")
+                }
+                guard let value = Float(arguments[index]) else {
+                    throw DepthRunnerError.invalidUsage("Value for --roi-margin must be a valid number.")
+                }
+                autoROIMargin = value
+                autoROIParameterUsed = true
+            case "--roi-min-size":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --roi-min-size option.")
+                }
+                guard let value = Float(arguments[index]) else {
+                    throw DepthRunnerError.invalidUsage("Value for --roi-min-size must be a valid number.")
+                }
+                autoROIMinSize = value
+                autoROIParameterUsed = true
+            case "--clip-ground":
+                clipGround = true
+            case "--ground-percentile":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --ground-percentile option.")
+                }
+                guard let value = Float(arguments[index]) else {
+                    throw DepthRunnerError.invalidUsage("Value for --ground-percentile must be a valid number.")
+                }
+                groundPercentile = value
+                groundPercentileSpecified = true
+            case "--ground-eps":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --ground-eps option.")
+                }
+                guard let value = Float(arguments[index]) else {
+                    throw DepthRunnerError.invalidUsage("Value for --ground-eps must be a valid number.")
+                }
+                groundEps = value
+                groundEpsSpecified = true
+            case "--no-auto-scale":
+                autoScaleDisabled = true
+            case "--trim-percentile":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --trim-percentile option.")
+                }
+                let valueString = arguments[index]
+                if let value = Float(valueString), value >= 0.90, value <= 0.999 {
+                    trimPercentile = value
+                } else {
+                    trimMessages.append("Warning: --trim-percentile must be between 0.90 and 0.999 (got \(valueString)); using default 0.98.")
+                    trimPercentile = 0.98
+                }
+            case "--z-band":
+                index += 1
+                guard index < arguments.count else {
+                    throw DepthRunnerError.invalidUsage("Missing value for --z-band option.")
+                }
+                let value = arguments[index]
+                let components = value.split(separator: ",")
+                if components.count == 2,
+                   let minValue = Float(components[0].trimmingCharacters(in: .whitespaces)),
+                   let maxValue = Float(components[1].trimmingCharacters(in: .whitespaces)),
+                   minValue >= 0,
+                   minValue < maxValue {
+                    zBandMin = minValue
+                    zBandMax = maxValue
+                } else {
+                    trimMessages.append("Warning: --z-band must be specified as min,max with min < max (got \(value)); using default 0.10,0.80.")
+                    zBandMin = 0.10
+                    zBandMax = 0.80
+                }
+            default:
+                if argument.hasPrefix("--") {
+                    throw DepthRunnerError.invalidUsage("Unknown option: \(argument)")
+                } else if inputPath == nil {
+                    inputPath = argument
+                } else {
+                    throw DepthRunnerError.invalidUsage("Unexpected extra argument: \(argument)")
+                }
+            }
+            index += 1
+        }
+
+        guard let resolvedInputPath = inputPath else {
+            throw DepthRunnerError.invalidUsage("Missing required <eingabe_bildpfad> argument.")
+        }
+
+        if (groundPercentileSpecified || groundEpsSpecified) && !clipGround {
+            throw DepthRunnerError.invalidUsage("--ground-percentile and --ground-eps require --clip-ground.")
+        }
+
+        if clipGround {
+            if groundPercentile <= 0 || groundPercentile > 1 {
+                throw DepthRunnerError.invalidUsage("--ground-percentile must be in the range (0, 1].")
+            }
+            if groundEps <= 0 {
+                throw DepthRunnerError.invalidUsage("--ground-eps must be a positive number.")
+            }
+        }
+
+        if autoROIParameterUsed && !autoROIRequested {
+            throw DepthRunnerError.invalidUsage("--roi-near-percentile, --roi-margin, and --roi-min-size require --roi-auto.")
+        }
+
+        if autoROIRequested {
+            if autoROINearPercentile < 0.10 || autoROINearPercentile > 0.50 {
+                roiMessages.append(String(format: "Warning: --roi-near-percentile must be between 0.10 and 0.50 (got %.3f); using default 0.30.", autoROINearPercentile))
+                autoROINearPercentile = 0.30
+            }
+            if autoROIMargin < 0 || autoROIMargin > 0.20 {
+                roiMessages.append(String(format: "Warning: --roi-margin must be between 0.00 and 0.20 (got %.3f); using default 0.05.", autoROIMargin))
+                autoROIMargin = 0.05
+            }
+            if autoROIMinSize < 0.20 || autoROIMinSize > 0.70 {
+                roiMessages.append(String(format: "Warning: --roi-min-size must be between 0.20 and 0.70 (got %.3f); using default 0.35.", autoROIMinSize))
+                autoROIMinSize = 0.35
+            }
+            roiSpecifier = .auto(
+                AutoROIConfig(
+                    nearPercentile: autoROINearPercentile,
+                    margin: autoROIMargin,
+                    minSize: autoROIMinSize
+                )
+            )
+        }
+
+        var intrinsicsSpecifier: IntrinsicsSpecifier = .unspecified
+
+        if let fxValue = fx, let fyValue = fy, let cxValue = cx, let cyValue = cy {
+            if fxValue > 0, fyValue > 0 {
+                intrinsicsSpecifier = .explicit(CameraIntrinsics(fx: fxValue, fy: fyValue, cx: cxValue, cy: cyValue))
+            } else {
+                intrinsicsIssues.append("fx and fy must be positive numbers.")
+            }
+        } else if fx != nil || fy != nil || cx != nil || cy != nil {
+            intrinsicsIssues.append("All of --fx, --fy, --cx, and --cy must be provided together.")
+        }
+
+        if let fovValue = providedFOV {
+            if fovValue > 0, fovValue < 180 {
+                switch intrinsicsSpecifier {
+                case .explicit:
+                    ignoredFOV = fovValue
+                default:
+                    intrinsicsSpecifier = .fov(fovValue)
+                }
+            } else {
+                intrinsicsIssues.append("Field of view must be between 0 and 180 degrees (exclusive).")
+            }
+        }
+
+        if intrinsicsIssues.contains(where: { !$0.isEmpty }) {
+            if case .unspecified = intrinsicsSpecifier {
+                intrinsicsSpecifier = .invalid(intrinsicsIssues.joined(separator: " "))
+            }
+        }
+
+        let groundConfig = clipGround ? GroundClipConfig(percentile: groundPercentile, eps: groundEps) : nil
+        let trimConfig = TrimConfig(percentile: trimPercentile, zMin: zBandMin, zMax: zBandMax)
+
+        return CommandLineOptions(
+            inputPath: resolvedInputPath,
+            outputPath: outputPath,
+            pointCloudRequests: pointCloudRequests,
+            volumeRequested: volumeRequested,
+            volumeUnit: volumeUnit,
+            intrinsicsSpecifier: intrinsicsSpecifier,
+            intrinsicsIssues: intrinsicsIssues,
+            ignoredFOV: ignoredFOV,
+            roiSpecifier: roiSpecifier,
+            roiMessages: roiMessages,
+            groundClipConfig: groundConfig,
+            trimConfig: trimConfig,
+            trimMessages: trimMessages,
+            autoScaleDisabled: autoScaleDisabled
+        )
+    }
+
+    var requiresPointCloud: Bool {
+        volumeRequested || !pointCloudRequests.isEmpty || groundClipConfig != nil
+    }
+
+    func resolveIntrinsics(width: Int, height: Int) -> (CameraIntrinsics, [String]) {
+        let fallbackFOV: Float = 60
+        var messages: [String] = []
+
+        if let ignoredFOV {
+            messages.append(String(format: "Warning: Ignoring --fov %.2f° because explicit intrinsics were provided.", ignoredFOV))
+        }
+
+        if !intrinsicsIssues.isEmpty, case .unspecified = intrinsicsSpecifier {
+            messages.append("Warning: Invalid camera intrinsics input detected (\(intrinsicsIssues.joined(separator: " "))). Falling back to default assumptions.")
+        }
+
+        switch intrinsicsSpecifier {
+        case .explicit(let intrinsics):
+            messages.append(String(format: "Using explicit camera intrinsics (fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f).", intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy))
+            return (intrinsics, messages)
+        case .fov(let fovValue):
+            let intrinsics = CommandLineOptions.makeIntrinsics(fromFOV: fovValue, width: width, height: height)
+            messages.append(String(format: "Using camera intrinsics derived from FOV=%.2f° (fx=%.2f, fy=%.2f, cx=%.2f, cy=%.2f).", fovValue, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy))
+            if !intrinsicsIssues.isEmpty {
+                messages.append("Warning: \(intrinsicsIssues.joined(separator: " "))")
+            }
+            return (intrinsics, messages)
+        case .unspecified:
+            if !intrinsicsIssues.isEmpty {
+                messages.append("Warning: \(intrinsicsIssues.joined(separator: " "))")
+            }
+            let intrinsics = CommandLineOptions.makeIntrinsics(fromFOV: fallbackFOV, width: width, height: height)
+            messages.append(String(format: "Warning: Assuming FOV=%.2f° with cx=%.2f, cy=%.2f (fx=%.2f, fy=%.2f).", fallbackFOV, intrinsics.cx, intrinsics.cy, intrinsics.fx, intrinsics.fy))
+            return (intrinsics, messages)
+        case .invalid(let reason):
+            if !reason.isEmpty {
+                messages.append("Warning: \(reason)")
+            } else if !intrinsicsIssues.isEmpty {
+                messages.append("Warning: \(intrinsicsIssues.joined(separator: " "))")
+            }
+            let intrinsics = CommandLineOptions.makeIntrinsics(fromFOV: fallbackFOV, width: width, height: height)
+            messages.append(String(format: "Warning: Falling back to FOV=%.2f° with cx=%.2f, cy=%.2f (fx=%.2f, fy=%.2f).", fallbackFOV, intrinsics.cx, intrinsics.cy, intrinsics.fx, intrinsics.fy))
+            return (intrinsics, messages)
+        }
+    }
+
+    private static func makeIntrinsics(fromFOV fov: Float, width: Int, height: Int) -> CameraIntrinsics {
+        let radians = fov * .pi / 180
+        let fx = (0.5 * Float(width)) / tan(radians / 2)
+        let fy = fx
+        let cx = Float(width) / 2
+        let cy = Float(height) / 2
+        return CameraIntrinsics(fx: fx, fy: fy, cx: cx, cy: cy)
+    }
+}
+
+private struct ModelLocator {
+    private let fileManager = FileManager.default
+
+    func locateModel() throws -> URL {
+        let bundle = Bundle.main
+        if let resourceURLs = bundle.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil),
+           let first = resourceURLs.first {
+            return first
+        }
+        if let resourceURLs = bundle.urls(forResourcesWithExtension: "mlmodel", subdirectory: nil),
+           let first = resourceURLs.first {
+            return try compileModelIfNeeded(at: first)
+        }
+
+#if SWIFT_PACKAGE
+        let packageBundle = Bundle.module
+        if let resourceURLs = packageBundle.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil),
+           let first = resourceURLs.first {
+            return first
+        }
+        if let resourceURLs = packageBundle.urls(forResourcesWithExtension: "mlmodel", subdirectory: nil),
+           let first = resourceURLs.first {
+            return try compileModelIfNeeded(at: first)
+        }
+#endif
+
+        let workingDirectory = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+        let searchDirectories = [
+            workingDirectory.appendingPathComponent("Models", isDirectory: true),
+            workingDirectory.appendingPathComponent("DepthPrediction-CoreML/mlmodel", isDirectory: true),
+            workingDirectory
+        ]
+
+        for directory in searchDirectories {
+            if let url = try findModel(in: directory) {
+                return url
+            }
+        }
+
+        if let enumerator = fileManager.enumerator(at: workingDirectory, includingPropertiesForKeys: nil) {
+            for case let url as URL in enumerator {
+                if let modelURL = try findModel(at: url) {
+                    return modelURL
+                }
+            }
+        }
+
+        throw DepthRunnerError.modelNotFound
+    }
+
+    private func findModel(in directory: URL) throws -> URL? {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return nil
+        }
+        let contents = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        for item in contents {
+            if let modelURL = try findModel(at: item) {
+                return modelURL
+            }
+        }
+        return nil
+    }
+
+    private func findModel(at url: URL) throws -> URL? {
+        if url.pathExtension == "mlmodelc" {
+            return url
+        }
+        if url.pathExtension == "mlmodel" {
+            return try compileModelIfNeeded(at: url)
+        }
+        return nil
+    }
+
+    private func compileModelIfNeeded(at url: URL) throws -> URL {
+        let compiledURL = url.appendingPathExtension("mlmodelc")
+        if fileManager.fileExists(atPath: compiledURL.path) {
+            return compiledURL
+        }
+        return try MLModel.compileModel(at: url)
+    }
+}
+
+private struct DepthMapGenerator {
+    private struct DepthData {
+        let values: [Float]
+        let width: Int
+        let height: Int
+        let pixelBuffer: CVPixelBuffer
+    }
+
+    private let model: MLModel
+
+    init(modelURL: URL) throws {
+        self.model = try MLModel(contentsOf: modelURL)
+    }
+
+    func generateDepthMap(inputPath: String, outputPath: String?) throws -> DepthGenerationResult {
+        let expandedInput = (inputPath as NSString).expandingTildeInPath
+        let inputURL = URL(fileURLWithPath: expandedInput)
+        guard FileManager.default.fileExists(atPath: inputURL.path) else {
+            throw DepthRunnerError.inputNotFound(inputPath)
+        }
+
+        let cgImage = try loadImage(at: inputURL)
+        let inputFeatures = try prepareInputFeatures(from: cgImage)
+        let output = try model.prediction(from: inputFeatures)
+
+        let depthData = try extractDepthData(from: output)
+        let grayscaleData = normalize(values: depthData.values)
+        let depthImage = try makeGrayscaleImage(from: grayscaleData, width: depthData.width, height: depthData.height)
+
+        let destinationURL = try resolveOutputURL(from: outputPath)
+        try save(image: depthImage, to: destinationURL)
+
+        return DepthGenerationResult(
+            depthPixelBuffer: depthData.pixelBuffer,
+            width: depthData.width,
+            height: depthData.height,
+            destinationURL: destinationURL
+        )
+    }
+
+    private func prepareInputFeatures(from image: CGImage) throws -> MLDictionaryFeatureProvider {
+        guard let (name, description) = model.modelDescription.inputDescriptionsByName.first(where: { $0.value.type == .image }),
+              let constraint = description.imageConstraint else {
+            throw DepthRunnerError.unsupportedModel("Model does not expose an image input.")
+        }
+
+        let size = CGSize(width: constraint.pixelsWide, height: constraint.pixelsHigh)
+        let pixelBuffer = try makePixelBuffer(from: image, size: size)
+        let featureValue = try MLFeatureValue(pixelBuffer: pixelBuffer, orientation: .up, constraint: constraint)
+        return try MLDictionaryFeatureProvider(dictionary: [name: featureValue])
+    }
+
+    private func extractDepthData(from provider: MLFeatureProvider) throws -> DepthData {
+        guard let featureName = provider.featureNames.first else {
+            throw DepthRunnerError.unsupportedModel("Model produced no output features.")
+        }
+        guard let featureValue = provider.featureValue(for: featureName) else {
+            throw DepthRunnerError.unsupportedModel("Missing output feature \(featureName) in prediction results.")
+        }
+
+        if let multiArray = featureValue.multiArrayValue {
+            return try extractDepthData(from: multiArray)
+        }
+        if let buffer = featureValue.imageBufferValue {
+            return try extractDepthData(from: buffer)
+        }
+        throw DepthRunnerError.unsupportedModel("Model output \(featureName) must be an image or multi-array.")
+    }
+
+    private func extractDepthData(from multiArray: MLMultiArray) throws -> DepthData {
+        let shape = multiArray.shape.map { Int(truncating: $0) }
+        let dimensions: (height: Int, width: Int)
+        switch shape.count {
+        case 2:
+            dimensions = (shape[0], shape[1])
+        case 3:
+            if shape[0] == 1 {
+                dimensions = (shape[1], shape[2])
+            } else if shape[2] == 1 {
+                dimensions = (shape[0], shape[1])
+            } else {
+                throw DepthRunnerError.unsupportedModel("Unsupported multi-array shape: \(shape)")
+            }
+        default:
+            throw DepthRunnerError.unsupportedModel("Unsupported multi-array shape: \(shape)")
+        }
+
+        let floats = try multiArray.toFloatArray()
+        let pixelBuffer = try makeDepthPixelBuffer(from: floats, width: dimensions.width, height: dimensions.height)
+        return DepthData(values: floats, width: dimensions.width, height: dimensions.height, pixelBuffer: pixelBuffer)
+    }
+
+    private func extractDepthData(from pixelBuffer: CVPixelBuffer) throws -> DepthData {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let count = width * height
+        var values = [Float](repeating: 0, count: count)
+
+        switch pixelFormat {
+        case kCVPixelFormatType_OneComponent32Float:
+            guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                throw DepthRunnerError.imageCreationFailed
+            }
+            let pointer = baseAddress.assumingMemoryBound(to: Float.self)
+            for index in 0..<count {
+                values[index] = pointer[index]
+            }
+        case kCVPixelFormatType_OneComponent16Half:
+            guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                throw DepthRunnerError.imageCreationFailed
+            }
+            let pointer = baseAddress.assumingMemoryBound(to: UInt16.self)
+            for index in 0..<count {
+                let float16 = Float16(bitPattern: pointer[index])
+                values[index] = Float(float16)
+            }
+        default:
+            throw DepthRunnerError.unsupportedModel("Unsupported pixel buffer format: \(pixelFormat)")
+        }
+
+        return DepthData(values: values, width: width, height: height, pixelBuffer: pixelBuffer)
+    }
+
+    private func makeDepthPixelBuffer(from values: [Float], width: Int, height: Int) throws -> CVPixelBuffer {
+        var pixelBufferOptional: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_OneComponent32Float,
+            nil,
+            &pixelBufferOptional
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer = pixelBufferOptional else {
+            throw DepthRunnerError.imageCreationFailed
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw DepthRunnerError.imageCreationFailed
+        }
+
+        let rowStride = CVPixelBufferGetBytesPerRow(pixelBuffer) / MemoryLayout<Float>.size
+        values.withUnsafeBufferPointer { buffer in
+            let pointer = baseAddress.assumingMemoryBound(to: Float.self)
+            for row in 0..<height {
+                let destination = pointer.advanced(by: row * rowStride)
+                let source = buffer.baseAddress!.advanced(by: row * width)
+                destination.assign(from: source, count: width)
+            }
+        }
+
+        return pixelBuffer
+    }
+
+    private func normalize(values: [Float]) -> [UInt8] {
+        guard let minValue = values.min(), let maxValue = values.max(), maxValue > minValue else {
+            return [UInt8](repeating: 0, count: values.count)
+        }
+        let range = maxValue - minValue
+        return values.map { value in
+            let normalized = (value - minValue) / range
+            return UInt8(clamping: Int(round(normalized * 255)))
+        }
+    }
+
+    private func makeGrayscaleImage(from pixels: [UInt8], width: Int, height: Int) throws -> CGImage {
+        let bytesPerRow = width
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let data = Data(pixels)
+        guard let provider = CGDataProvider(data: data as CFData) else {
+            throw DepthRunnerError.imageCreationFailed
+        }
+        guard let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: [],
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else {
+            throw DepthRunnerError.imageCreationFailed
+        }
+        return image
+    }
+
+    private func resolveOutputURL(from providedPath: String?) throws -> URL {
+        let baseDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        if let path = providedPath {
+            let expandedPath = (path as NSString).expandingTildeInPath
+            let url = URL(fileURLWithPath: expandedPath, relativeTo: baseDirectory)
+            let directoryURL = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            if url.pathExtension.isEmpty {
+                return url.appendingPathExtension("png")
+            }
+            return url
+        } else {
+            let directory = baseDirectory.appendingPathComponent("output", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory.appendingPathComponent("depth_map.png")
+        }
+    }
+
+    private func save(image: CGImage, to url: URL) throws {
+        #if canImport(UniformTypeIdentifiers)
+        let pngUTI = UTType.png.identifier as CFString
+        #elseif canImport(MobileCoreServices)
+        let pngUTI = kUTTypePNG
+        #else
+        let pngUTI = "public.png" as CFString
+        #endif
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, pngUTI, 1, nil) else {
+            throw DepthRunnerError.imageCreationFailed
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        if !CGImageDestinationFinalize(destination) {
+            throw DepthRunnerError.imageWriteFailed(url.path)
+        }
+    }
+
+    enum ROISpecifier {
+        case none
+        case center(Float)
+        case auto(AutoROIConfig)
+    }
+
+    func resolveManualROI(width: Int, height: Int) -> CGRect? {
+        guard case .center(let fraction) = roiSpecifier else {
+            return nil
+        }
+        let clampedFraction = max(0, min(1, fraction))
+        guard width > 0, height > 0, clampedFraction > 0 else {
+            return CGRect.null
+        }
+        let frameWidth = CGFloat(width)
+        let frameHeight = CGFloat(height)
+        let roiWidth = frameWidth * CGFloat(clampedFraction)
+        let roiHeight = frameHeight * CGFloat(clampedFraction)
+        let originX = (frameWidth - roiWidth) / 2
+        let originY = (frameHeight - roiHeight) / 2
+        return CGRect(x: originX, y: originY, width: roiWidth, height: roiHeight)
+    }
+
+    var roiDescription: String? {
+        switch roiSpecifier {
+        case .none:
+            return nil
+        case .center(let fraction):
+            return String(format: "center=%.2f", fraction)
+        case .auto:
+            return "auto"
+        }
+    }
+
+    var usesAutoROI: Bool {
+        if case .auto = roiSpecifier {
+            return true
+        }
+        return false
+    }
+}
+
+private func loadImage(at url: URL) throws -> CGImage {
+    let options: [CIImageOption: Any] = [.applyOrientationProperty: true]
+    guard let ciImage = CIImage(contentsOf: url, options: options) else {
+        throw DepthRunnerError.imageLoadFailed(url.path)
+    }
+    let context = CIContext()
+    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+        throw DepthRunnerError.imageLoadFailed(url.path)
+    }
+    return cgImage
+}
+
+private func makePixelBuffer(from image: CGImage, size: CGSize) throws -> CVPixelBuffer {
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferCGImageCompatibilityKey: true,
+        kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+    ]
+    var pixelBufferOptional: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        Int(size.width),
+        Int(size.height),
+        kCVPixelFormatType_32BGRA,
+        attrs as CFDictionary,
+        &pixelBufferOptional
+    )
+    guard status == kCVReturnSuccess, let pixelBuffer = pixelBufferOptional else {
+        throw DepthRunnerError.imageCreationFailed
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+    guard let context = CGContext(
+        data: CVPixelBufferGetBaseAddress(pixelBuffer),
+        width: Int(size.width),
+        height: Int(size.height),
+        bitsPerComponent: 8,
+        bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+    ) else {
+        throw DepthRunnerError.imageCreationFailed
+    }
+
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(origin: .zero, size: size))
+    return pixelBuffer
+}
+
+private func resolvePointCloudURL(from path: String, defaultExtension: String) throws -> URL {
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        throw DepthRunnerError.invalidUsage("Point cloud output path must not be empty.")
+    }
+
+    let baseDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let expandedPath = (trimmed as NSString).expandingTildeInPath
+    var url = URL(fileURLWithPath: expandedPath, relativeTo: baseDirectory)
+    if url.pathExtension.isEmpty {
+        url.appendPathExtension(defaultExtension)
+    }
+    return url
+}
+
+private enum DepthRunnerError: LocalizedError {
+    case invalidUsage(String)
+    case inputNotFound(String)
+    case modelNotFound
+    case unsupportedModel(String)
+    case imageLoadFailed(String)
+    case imageCreationFailed
+    case imageWriteFailed(String)
+    case pointCloudWriteFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidUsage(let message):
+            return "\(message)\nUsage: swift run DepthRunner <eingabe_bildpfad> [--out <ausgabe_pfad>] [--ply <ply_pfad>] [--xyz <xyz_pfad>] [--fov <grad> | --fx <fx> --fy <fy> --cx <cx> --cy <cy>]"
+        case .inputNotFound(let path):
+            return "Input image not found at path: \(path)"
+        case .modelNotFound:
+            return "Could not locate a Core ML depth model (.mlmodel or .mlmodelc)."
+        case .unsupportedModel(let message):
+            return message
+        case .imageLoadFailed(let path):
+            return "Unable to load image at path: \(path)"
+        case .imageCreationFailed:
+            return "Failed to create image buffer."
+        case .imageWriteFailed(let path):
+            return "Failed to write PNG to \(path)"
+        case .pointCloudWriteFailed(let path):
+            return "Failed to write point cloud to \(path)"
+        }
+    }
+}
+
+private extension MLMultiArray {
+    func toFloatArray() throws -> [Float] {
+        let totalCount = count
+        var result = [Float](repeating: 0, count: totalCount)
+        switch dataType {
+        case .float32:
+            let pointer = dataPointer.bindMemory(to: Float32.self, capacity: totalCount)
+            for index in 0..<totalCount {
+                result[index] = Float(pointer[index])
+            }
+        case .double:
+            let pointer = dataPointer.bindMemory(to: Double.self, capacity: totalCount)
+            for index in 0..<totalCount {
+                result[index] = Float(pointer[index])
+            }
+        case .float16:
+            let pointer = dataPointer.bindMemory(to: UInt16.self, capacity: totalCount)
+            for index in 0..<totalCount {
+                let float16 = Float16(bitPattern: pointer[index])
+                result[index] = Float(float16)
+            }
+        default:
+            throw DepthRunnerError.unsupportedModel("Unsupported multi-array data type: \(dataType)")
+        }
+        return result
+    }
+}
