@@ -10,6 +10,43 @@ This project is Depth Prediction on iOS with Core ML.<br>If you are interested i
 | ------------ | ------------ | ------------ | ------------ | ------------ |
 | <img src="https://user-images.githubusercontent.com/37643248/99881941-428dbd80-2c60-11eb-9c24-fdab5b110279.gif" width=240px> | <img src="resource/IMG_3623.PNG" width=240px> | <img src="resource/IMG_3626.PNG" width=240px> | <img src="resource/IMG_3627.PNG" width=240px> | <img src="resource/IMG_3629.PNG" width=240px> |
 
+## Command Line Depth Runner
+
+This repository also includes a Swift Package executable that allows you to generate a depth map from any local image on macOS.
+
+```bash
+swift run DepthRunner path/to/input.jpg
+swift run DepthRunner path/to/input.jpg --out output/my_depth.png
+swift run DepthRunner path/to/input.jpg --out output/depth.png --ply output/points.ply --fov 60
+swift run DepthRunner path/to/input.jpg --ply output/points.ply --fx 1450 --fy 1450 --cx 960 --cy 720
+swift run DepthRunner path/to/input.jpg --fov 60 --volume --unit ml
+swift run DepthRunner input.jpg --fx 1450 --fy 1450 --cx 960 --cy 720 --volume --ply output/points.ply
+swift run DepthRunner input.jpg --fov 60 --volume --roi center=0.6
+swift run DepthRunner input.jpg --fov 60 --volume --roi-auto --roi-margin 0.05 --roi-min-size 0.40
+swift run DepthRunner input.jpg --fov 60 --volume --clip-ground --ground-percentile 0.12 --ground-eps 0.010
+swift run DepthRunner input.jpg --fov 60 --clip-ground --trim-percentile 0.98 --z-band 0.10,0.80 --volume
+swift run DepthRunner input.jpg --fov 60 --volume --no-auto-scale
+```
+
+The tool locates the bundled MiDaS Small Core ML model (or another depth model present in the repository), runs inference, normalizes the resulting depth values to the range `[0, 255]`, and saves a grayscale PNG where brighter pixels are closer to the camera. When `--ply` or `--xyz` outputs are requested, the normalized depth map is additionally back-projected into a filtered point cloud using either the supplied camera intrinsics (`--fx`, `--fy`, `--cx`, `--cy`) or a field-of-view estimate (`--fov`). If neither is provided, the runner warns and falls back to a 60° pinhole assumption using the depth map resolution.
+
+Enabling `--volume` computes an axis-aligned bounding box over the filtered point cloud and logs the enclosed volume in milliliters (default), cubic centimeters, or cubic meters depending on `--unit`. You can limit the evaluation to a centered region of the depth map via `--roi center=<fraction>` or let the runner select a bounding box automatically with `--roi-auto`, which focuses on the closest percentile of valid depths and can be tuned through `--roi-near-percentile`, `--roi-margin`, and `--roi-min-size`. When table or floor pixels should be excluded from the measurement, add `--clip-ground` to fit a ground plane to the lowest depths and remove points within an epsilon band (default `ε=8 mm`, configurable through `--ground-eps`). The percentile used for plane fitting defaults to the lowest 10% of depth values and can be tuned with `--ground-percentile`. Additional trimming options clamp the point cloud to a configurable depth band via `--z-band min,max` (default `0.10,0.80`) and remove extreme x/y/z outliers with `--trim-percentile` (default `0.98`), helping stabilize the volume estimate in the presence of noisy pixels. By default the pipeline auto-scales the measured ROI to assume a 25 cm plate diameter before computing the bounding box volume; disable this developer aid with `--no-auto-scale` if you need the raw scale.
+
+### Plausibility Logging
+
+DepthRunner collects compact plausibility metrics once the point cloud has been filtered, clipped, and (optionally) auto-scaled so that obviously broken depth inputs do not silently produce fantasy numbers. The log block reports the number of usable points, ROI coverage, bounding boxes before/after scaling, the applied scaling factor, and the final volume in milliliters. Threshold-based warnings are emitted without aborting the run, and you can summarise them at the end by passing `--strict-warn` (useful for automated checks).
+
+```
+Points: total=18234, used=17998, roi_pixels=92160, roi_cov=36.0%
+BBox[m]: pre x:[-0.059, 0.064] y:[-0.061, 0.058] z:[0.129, 0.182] | post x:[-0.064, 0.069] y:[-0.066, 0.063] z:[0.140, 0.198]
+Scale: assumed=0.25 m, measured=0.2360 m, factor=1.059
+Volume: 510.4 ml (0.000510 m3)
+⚠️ Volume out of nominal range (510.4 ml)
+WARN: volume_out_of_range
+```
+
+Warnings are normal when the underlying photo is poor or a fallback ROI had to be chosen—the runner still returns exit code `0` so downstream tooling can decide how to react.
+
 ## How it works
 
 > When use Metal
