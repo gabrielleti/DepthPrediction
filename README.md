@@ -10,6 +10,26 @@ This project is Depth Prediction on iOS with Core ML.<br>If you are interested i
 | ------------ | ------------ | ------------ | ------------ | ------------ |
 | <img src="https://user-images.githubusercontent.com/37643248/99881941-428dbd80-2c60-11eb-9c24-fdab5b110279.gif" width=240px> | <img src="resource/IMG_3623.PNG" width=240px> | <img src="resource/IMG_3626.PNG" width=240px> | <img src="resource/IMG_3627.PNG" width=240px> | <img src="resource/IMG_3629.PNG" width=240px> |
 
+## Command Line Depth Runner
+
+This repository also includes a Swift Package executable that allows you to generate a depth map from any local image on macOS.
+
+```bash
+swift run DepthRunner path/to/input.jpg
+swift run DepthRunner path/to/input.jpg --out output/my_depth.png
+swift run DepthRunner path/to/input.jpg --out output/depth.png --ply output/points.ply --fov 60
+swift run DepthRunner path/to/input.jpg --ply output/points.ply --fx 1450 --fy 1450 --cx 960 --cy 720
+swift run DepthRunner path/to/input.jpg --fov 60 --volume --unit ml
+swift run DepthRunner input.jpg --fx 1450 --fy 1450 --cx 960 --cy 720 --volume --ply output/points.ply
+swift run DepthRunner input.jpg --fov 60 --volume --roi center=0.6
+swift run DepthRunner input.jpg --fov 60 --volume --clip-ground --ground-percentile 0.12 --ground-eps 0.010
+swift run DepthRunner input.jpg --fov 60 --clip-ground --trim-percentile 0.98 --z-band 0.10,0.80 --volume
+```
+
+The tool locates the bundled MiDaS Small Core ML model (or another depth model present in the repository), runs inference, normalizes the resulting depth values to the range `[0, 255]`, and saves a grayscale PNG where brighter pixels are closer to the camera. When `--ply` or `--xyz` outputs are requested, the normalized depth map is additionally back-projected into a filtered point cloud using either the supplied camera intrinsics (`--fx`, `--fy`, `--cx`, `--cy`) or a field-of-view estimate (`--fov`). If neither is provided, the runner warns and falls back to a 60° pinhole assumption using the depth map resolution.
+
+Enabling `--volume` computes an axis-aligned bounding box over the filtered point cloud and logs the enclosed volume in milliliters (default), cubic centimeters, or cubic meters depending on `--unit`. You can limit the evaluation to a centered region of the depth map via `--roi center=<fraction>` before exporting point clouds or reporting volume. When table or floor pixels should be excluded from the measurement, add `--clip-ground` to fit a ground plane to the lowest depths and remove points within an epsilon band (default `ε=8 mm`, configurable through `--ground-eps`). The percentile used for plane fitting defaults to the lowest 10% of depth values and can be tuned with `--ground-percentile`. Additional trimming options clamp the point cloud to a configurable depth band via `--z-band min,max` (default `0.10,0.80`) and remove extreme x/y/z outliers with `--trim-percentile` (default `0.98`), helping stabilize the volume estimate in the presence of noisy pixels.
+
 ## How it works
 
 > When use Metal
